@@ -998,6 +998,43 @@ include_dir 'conf.d'
       </listitem>
      </varlistentry>
 
+     <varlistentry id="guc-client-connection-check-interval" xreflabel="client_connection_check_interval">
+      <term><varname>client_connection_check_interval</varname> (<type>integer</type>)
+      <indexterm>
+       <primary><varname>client_connection_check_interval</varname> configuration parameter</primary>
+      </indexterm>
+      </term>
+      <listitem>
+       <para>
+        Sets the time interval between optional checks that the client is still
+        connected, while running queries.  The check is performed by polling
+        the socket, and allows long running queries to be aborted sooner if
+        the kernel reports that the connection is closed.
+       </para>
+       <para>
+        This option is currently available only on systems that support the
+        non-standard <symbol>POLLRDHUP</symbol> extension to the
+        <symbol>poll</symbol> system call, including Linux.
+       </para>
+       <para>
+        If the value is specified without units, it is taken as milliseconds.
+        The default value is <literal>0</literal>, which disables connection
+        checks.  Without connection checks, the server will detect the loss of
+        the connection only at the next interaction with the socket, when it
+        waits for, receives or sends data.
+       </para>
+       <para>
+        For the kernel itself to detect lost TCP connections reliably and within
+        a known timeframe in all scenarios including network failure, it may
+        also be necessary to adjust the TCP keepalive settings of the operating
+        system, or the <xref linkend="guc-tcp-keepalives-idle"/>,
+        <xref linkend="guc-tcp-keepalives-interval"/> and
+        <xref linkend="guc-tcp-keepalives-count"/> settings of
+        <productname>PostgreSQL</productname>.
+       </para>
+      </listitem>
+     </varlistentry>
+
      </variablelist>
      </sect2>
 
@@ -1770,8 +1807,9 @@ include_dir 'conf.d'
         fact in mind when choosing the value.  Sort operations are used
         for <literal>ORDER BY</literal>, <literal>DISTINCT</literal>,
         and merge joins.
-        Hash tables are used in hash joins, hash-based aggregation, and
-        hash-based processing of <literal>IN</literal> subqueries.
+        Hash tables are used in hash joins, hash-based aggregation, result
+        cache nodes and hash-based processing of <literal>IN</literal>
+        subqueries.
        </para>
        <para>
         Hash-based operations are generally more sensitive to memory
@@ -2682,6 +2720,10 @@ include_dir 'conf.d'
         data from a base backup and the WAL logs, so <literal>replica</literal> or
         higher must be used to enable WAL archiving
         (<xref linkend="guc-archive-mode"/>) and streaming replication.
+        Note that changing <varname>wal_level</varname> to
+        <literal>minimal</literal> makes any base backups taken before
+        unavailable for archive recovery and standby server, which may
+        lead to database loss.
        </para>
        <para>
         In <literal>logical</literal> level, the same information is logged as
@@ -4312,7 +4354,9 @@ ANY <replaceable class="parameter">num_sync</replaceable> ( <replaceable class="
      <title>Standby Servers</title>
 
      <para>
-      These settings control the behavior of a standby server that is
+      These settings control the behavior of a
+      <link linkend="standby-server-operation">standby server</link>
+      that is
       to receive replication data.  Their values on the primary server
       are irrelevant.
      </para>
@@ -4787,6 +4831,20 @@ ANY <replaceable class="parameter">num_sync</replaceable> ( <replaceable class="
       </para>
 
      <variablelist>
+     <varlistentry id="guc-enable-async-append" xreflabel="enable_async_append">
+      <term><varname>enable_async_append</varname> (<type>boolean</type>)
+      <indexterm>
+       <primary><varname>enable_async_append</varname> configuration parameter</primary>
+      </indexterm>
+      </term>
+      <listitem>
+       <para>
+        Enables or disables the query planner's use of async-aware
+        append plan types. The default is <literal>on</literal>.
+       </para>
+      </listitem>
+     </varlistentry>
+
      <varlistentry id="guc-enable-bitmapscan" xreflabel="enable_bitmapscan">
       <term><varname>enable_bitmapscan</varname> (<type>boolean</type>)
       <indexterm>
@@ -4905,6 +4963,25 @@ ANY <replaceable class="parameter">num_sync</replaceable> ( <replaceable class="
         but turning this variable off prevents the planner from inserting
         materialize nodes except in cases where it is required for correctness.
         The default is <literal>on</literal>.
+       </para>
+      </listitem>
+     </varlistentry>
+
+     <varlistentry id="guc-enable-resultcache" xreflabel="enable_resultcache">
+      <term><varname>enable_resultcache</varname> (<type>boolean</type>)
+      <indexterm>
+       <primary><varname>enable_resultcache</varname> configuration parameter</primary>
+      </indexterm>
+      </term>
+      <listitem>
+       <para>
+        Enables or disables the query planner's use of result cache plans for
+        caching results from parameterized scans inside nested-loop joins.
+        This plan type allows scans to the underlying plans to be skipped when
+        the results for the current parameters are already in the cache.  Less
+        commonly looked up results may be evicted from the cache when more
+        space is required for new entries. The default is
+        <literal>on</literal>.
        </para>
       </listitem>
      </varlistentry>
@@ -6678,7 +6755,8 @@ local0.*    /var/log/postgresql
       <listitem>
        <para>
         Causes each attempted connection to the server to be logged,
-        as well as successful completion of client authentication.
+        as well as successful completion of both client authentication (if
+        necessary) and authorization.
         Only superusers can change this parameter at session start,
         and it cannot be changed at all within a session.
         The default is <literal>off</literal>.

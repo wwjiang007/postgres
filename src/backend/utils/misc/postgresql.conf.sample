@@ -366,11 +366,13 @@
 #enable_seqscan = on
 #enable_sort = on
 #enable_incremental_sort = on
+#enable_resultcache = on
 #enable_tidscan = on
 #enable_partitionwise_join = off
 #enable_partitionwise_aggregate = off
 #enable_parallel_hash = on
 #enable_partition_pruning = on
+#enable_async_append = on
 
 # - Planner Cost Constants -
 
@@ -717,6 +719,9 @@
 
 #dynamic_library_path = '$libdir'
 
+#client_connection_check_interval = 0	# time between checks for client
+					# disconnection while running queries;
+					# 0 for never
 
 #------------------------------------------------------------------------------
 # LOCK MANAGEMENT
