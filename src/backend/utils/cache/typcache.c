@@ -60,6 +60,7 @@
 #include "executor/executor.h"
 #include "lib/dshash.h"
 #include "optimizer/optimizer.h"
+#include "port/pg_bitutils.h"
 #include "storage/lwlock.h"
 #include "utils/builtins.h"
 #include "utils/catcache.h"
@@ -696,7 +697,7 @@ lookup_type_cache(Oid type_id, int flags)
 				 !record_fields_have_hashing(typentry))
 			hash_proc = InvalidOid;
 		else if (hash_proc == F_HASH_RANGE &&
-			!range_element_has_hashing(typentry))
+				 !range_element_has_hashing(typentry))
 			hash_proc = InvalidOid;
 
 		/*
@@ -742,10 +743,10 @@ lookup_type_cache(Oid type_id, int flags)
 			!array_element_has_extended_hashing(typentry))
 			hash_extended_proc = InvalidOid;
 		else if (hash_extended_proc == F_HASH_RECORD_EXTENDED &&
-			!record_fields_have_extended_hashing(typentry))
+				 !record_fields_have_extended_hashing(typentry))
 			hash_extended_proc = InvalidOid;
 		else if (hash_extended_proc == F_HASH_RANGE_EXTENDED &&
-			!range_element_has_extended_hashing(typentry))
+				 !range_element_has_extended_hashing(typentry))
 			hash_extended_proc = InvalidOid;
 
 		/*
@@ -1708,10 +1709,7 @@ ensure_record_cache_typmod_slot_exists(int32 typmod)
 
 	if (typmod >= RecordCacheArrayLen)
 	{
-		int32		newlen = RecordCacheArrayLen * 2;
-
-		while (typmod >= newlen)
-			newlen *= 2;
+		int32		newlen = pg_nextpower2_32(typmod + 1);
 
 		RecordCacheArray = (TupleDesc *) repalloc(RecordCacheArray,
 												  newlen * sizeof(TupleDesc));
@@ -2822,7 +2820,7 @@ find_or_make_matching_shared_tupledesc(TupleDesc tupdesc)
 		Assert(record_table_entry->key.shared);
 		result = (TupleDesc)
 			dsa_get_address(CurrentSession->area,
-							record_table_entry->key.shared);
+							record_table_entry->key.u.shared_tupdesc);
 		Assert(result->tdrefcount == -1);
 
 		return result;

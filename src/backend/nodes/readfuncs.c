@@ -263,6 +263,7 @@ _readQuery(void)
 	READ_BOOL_FIELD(hasModifyingCTE);
 	READ_BOOL_FIELD(hasForUpdate);
 	READ_BOOL_FIELD(hasRowSecurity);
+	READ_BOOL_FIELD(isReturn);
 	READ_NODE_FIELD(cteList);
 	READ_NODE_FIELD(rtable);
 	READ_NODE_FIELD(jointree);
@@ -830,6 +831,7 @@ _readScalarArrayOpExpr(void)
 
 	READ_OID_FIELD(opno);
 	READ_OID_FIELD(opfuncid);
+	READ_OID_FIELD(hashfuncid);
 	READ_BOOL_FIELD(useOr);
 	READ_OID_FIELD(inputcollid);
 	READ_NODE_FIELD(args);
@@ -1695,6 +1697,7 @@ _readModifyTable(void)
 	READ_ENUM_FIELD(onConflictAction, OnConflictAction);
 	READ_NODE_FIELD(arbiterIndexes);
 	READ_NODE_FIELD(onConflictSet);
+	READ_NODE_FIELD(onConflictCols);
 	READ_NODE_FIELD(onConflictWhere);
 	READ_UINT_FIELD(exclRelRTI);
 	READ_NODE_FIELD(exclRelTlist);
@@ -2070,6 +2073,7 @@ _readForeignScan(void)
 	ReadCommonScan(&local_node->scan);
 
 	READ_ENUM_FIELD(operation, CmdType);
+	READ_UINT_FIELD(resultRelation);
 	READ_OID_FIELD(fs_server);
 	READ_NODE_FIELD(fdw_exprs);
 	READ_NODE_FIELD(fdw_private);
@@ -2077,7 +2081,6 @@ _readForeignScan(void)
 	READ_NODE_FIELD(fdw_recheck_quals);
 	READ_BITMAPSET_FIELD(fs_relids);
 	READ_BOOL_FIELD(fsSystemCol);
-	READ_INT_FIELD(resultRelation);
 
 	READ_DONE();
 }

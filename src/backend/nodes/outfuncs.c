@@ -418,6 +418,7 @@ _outModifyTable(StringInfo str, const ModifyTable *node)
 	WRITE_ENUM_FIELD(onConflictAction, OnConflictAction);
 	WRITE_NODE_FIELD(arbiterIndexes);
 	WRITE_NODE_FIELD(onConflictSet);
+	WRITE_NODE_FIELD(onConflictCols);
 	WRITE_NODE_FIELD(onConflictWhere);
 	WRITE_UINT_FIELD(exclRelRTI);
 	WRITE_NODE_FIELD(exclRelTlist);
@@ -700,6 +701,7 @@ _outForeignScan(StringInfo str, const ForeignScan *node)
 	_outScanInfo(str, (const Scan *) node);
 
 	WRITE_ENUM_FIELD(operation, CmdType);
+	WRITE_UINT_FIELD(resultRelation);
 	WRITE_OID_FIELD(fs_server);
 	WRITE_NODE_FIELD(fdw_exprs);
 	WRITE_NODE_FIELD(fdw_private);
@@ -707,7 +709,6 @@ _outForeignScan(StringInfo str, const ForeignScan *node)
 	WRITE_NODE_FIELD(fdw_recheck_quals);
 	WRITE_BITMAPSET_FIELD(fs_relids);
 	WRITE_BOOL_FIELD(fsSystemCol);
-	WRITE_INT_FIELD(resultRelation);
 }
 
 static void
@@ -1309,6 +1310,7 @@ _outScalarArrayOpExpr(StringInfo str, const ScalarArrayOpExpr *node)
 
 	WRITE_OID_FIELD(opno);
 	WRITE_OID_FIELD(opfuncid);
+	WRITE_OID_FIELD(hashfuncid);
 	WRITE_BOOL_FIELD(useOr);
 	WRITE_OID_FIELD(inputcollid);
 	WRITE_NODE_FIELD(args);
@@ -1855,6 +1857,16 @@ _outTidPath(StringInfo str, const TidPath *node)
 	_outPathInfo(str, (const Path *) node);
 
 	WRITE_NODE_FIELD(tidquals);
+}
+
+static void
+_outTidRangePath(StringInfo str, const TidRangePath *node)
+{
+	WRITE_NODE_TYPE("TIDRANGEPATH");
+
+	_outPathInfo(str, (const Path *) node);
+
+	WRITE_NODE_FIELD(tidrangequals);
 }
 
 static void
@@ -2776,6 +2788,7 @@ _outCreateStatsStmt(StringInfo str, const CreateStatsStmt *node)
 	WRITE_NODE_FIELD(exprs);
 	WRITE_NODE_FIELD(relations);
 	WRITE_STRING_FIELD(stxcomment);
+	WRITE_BOOL_FIELD(transformed);
 	WRITE_BOOL_FIELD(if_not_exists);
 }
 
@@ -2833,6 +2846,14 @@ _outSelectStmt(StringInfo str, const SelectStmt *node)
 	WRITE_BOOL_FIELD(all);
 	WRITE_NODE_FIELD(larg);
 	WRITE_NODE_FIELD(rarg);
+}
+
+static void
+_outReturnStmt(StringInfo str, const ReturnStmt *node)
+{
+	WRITE_NODE_TYPE("RETURN");
+
+	WRITE_NODE_FIELD(returnval);
 }
 
 static void
@@ -3047,6 +3068,7 @@ _outQuery(StringInfo str, const Query *node)
 	WRITE_BOOL_FIELD(hasModifyingCTE);
 	WRITE_BOOL_FIELD(hasForUpdate);
 	WRITE_BOOL_FIELD(hasRowSecurity);
+	WRITE_BOOL_FIELD(isReturn);
 	WRITE_NODE_FIELD(cteList);
 	WRITE_NODE_FIELD(rtable);
 	WRITE_NODE_FIELD(jointree);
@@ -4154,6 +4176,9 @@ outNode(StringInfo str, const void *obj)
 			case T_TidPath:
 				_outTidPath(str, obj);
 				break;
+			case T_TidRangePath:
+				_outTidRangePath(str, obj);
+				break;
 			case T_SubqueryScanPath:
 				_outSubqueryScanPath(str, obj);
 				break;
@@ -4336,6 +4361,9 @@ outNode(StringInfo str, const void *obj)
 				break;
 			case T_SelectStmt:
 				_outSelectStmt(str, obj);
+				break;
+			case T_ReturnStmt:
+				_outReturnStmt(str, obj);
 				break;
 			case T_PLAssignStmt:
 				_outPLAssignStmt(str, obj);

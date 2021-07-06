@@ -96,12 +96,29 @@ SHLIB_EXPORTS = exports.txt
 
 PKG_CONFIG_REQUIRES_PRIVATE = libssl libcrypto
 
-all: all-lib
+all: all-lib libpq-refs-stamp
 
 # Shared library stuff
 include $(top_srcdir)/src/Makefile.shlib
 backend_src = $(top_srcdir)/src/backend
 
+# Check for functions that libpq must not call, currently just exit().
+# (Ideally we'd reject abort() too, but there are various scenarios where
+# build toolchains insert abort() calls, e.g. to implement assert().)
+# If nm doesn't exist or doesn't work on shlibs, this test will do nothing,
+# which is fine.  The exclusion of __cxa_atexit is necessary on OpenBSD,
+# which seems to insert references to that even in pure C code.
+# Skip the test when profiling, as gcc may insert exit() calls for that.
+# Also skip the test on platforms where libpq infrastructure may be provided
+# by statically-linked libraries, as we can't expect them to honor this
+# coding rule.
+libpq-refs-stamp: $(shlib)
+ifneq ($(enable_coverage), yes)
+ifeq (,$(filter aix solaris,$(PORTNAME)))
+	! nm -A -u $< 2>/dev/null | grep -v __cxa_atexit | grep exit
+endif
+endif
+	touch $@
 
 # Make dependencies on pg_config_paths.h visible in all builds.
 fe-connect.o: fe-connect.c $(top_builddir)/src/port/pg_config_paths.h
@@ -132,7 +149,7 @@ uninstall: uninstall-lib
 
 clean distclean: clean-lib
 	$(MAKE) -C test $@
-	rm -f $(OBJS) pthread.h
+	rm -f $(OBJS) pthread.h libpq-refs-stamp
 # Might be left over from a Win32 client-only build
 	rm -f pg_config_paths.h
 

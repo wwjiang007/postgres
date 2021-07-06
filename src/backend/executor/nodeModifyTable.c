@@ -61,12 +61,12 @@ typedef struct MTTargetRelLookup
 } MTTargetRelLookup;
 
 static void ExecBatchInsert(ModifyTableState *mtstate,
-								 ResultRelInfo *resultRelInfo,
-								 TupleTableSlot **slots,
-								 TupleTableSlot **planSlots,
-								 int numSlots,
-								 EState *estate,
-								 bool canSetTag);
+							ResultRelInfo *resultRelInfo,
+							TupleTableSlot **slots,
+							TupleTableSlot **planSlots,
+							int numSlots,
+							EState *estate,
+							bool canSetTag);
 static bool ExecOnConflictUpdate(ModifyTableState *mtstate,
 								 ResultRelInfo *resultRelInfo,
 								 ItemPointer conflictTid,
@@ -377,9 +377,6 @@ ExecComputeStoredGenerated(ResultRelInfo *resultRelInfo,
  *
  * INSERT queries may need a projection to filter out junk attrs in the tlist.
  *
- * This is "one-time" for any given result rel, but we might touch
- * more than one result rel in the course of a partitioned INSERT.
- *
  * This is also a convenient place to verify that the
  * output of an INSERT matches the target table.
  */
@@ -447,7 +444,7 @@ ExecInitInsertProjection(ModifyTableState *mtstate,
  * identity info in the junk attrs.
  *
  * This is "one-time" for any given result rel, but we might touch more than
- * one result rel in the course of a partitioned UPDATE, and each one needs
+ * one result rel in the course of an inherited UPDATE, and each one needs
  * its own projection due to possible column order variation.
  *
  * This is also a convenient place to verify that the output of an UPDATE
@@ -495,6 +492,7 @@ ExecInitUpdateProjection(ModifyTableState *mtstate,
 
 	resultRelInfo->ri_projectNew =
 		ExecBuildUpdateProjection(subplan->targetlist,
+								  false,	/* subplan did the evaluation */
 								  updateColnos,
 								  relDesc,
 								  mtstate->ps.ps_ExprContext,
@@ -661,6 +659,12 @@ ExecInsert(ModifyTableState *mtstate,
 	else if (resultRelInfo->ri_FdwRoutine)
 	{
 		/*
+		 * GENERATED expressions might reference the tableoid column, so
+		 * (re-)initialize tts_tableOid before evaluating them.
+		 */
+		slot->tts_tableOid = RelationGetRelid(resultRelInfo->ri_RelationDesc);
+
+		/*
 		 * Compute stored generated columns
 		 */
 		if (resultRelationDesc->rd_att->constr &&
@@ -675,17 +679,17 @@ ExecInsert(ModifyTableState *mtstate,
 		if (resultRelInfo->ri_BatchSize > 1)
 		{
 			/*
-			 * If a certain number of tuples have already been accumulated,
-			 * or a tuple has come for a different relation than that for
-			 * the accumulated tuples, perform the batch insert
+			 * If a certain number of tuples have already been accumulated, or
+			 * a tuple has come for a different relation than that for the
+			 * accumulated tuples, perform the batch insert
 			 */
 			if (resultRelInfo->ri_NumSlots == resultRelInfo->ri_BatchSize)
 			{
 				ExecBatchInsert(mtstate, resultRelInfo,
-							   resultRelInfo->ri_Slots,
-							   resultRelInfo->ri_PlanSlots,
-							   resultRelInfo->ri_NumSlots,
-							   estate, canSetTag);
+								resultRelInfo->ri_Slots,
+								resultRelInfo->ri_PlanSlots,
+								resultRelInfo->ri_NumSlots,
+								estate, canSetTag);
 				resultRelInfo->ri_NumSlots = 0;
 			}
 
@@ -694,19 +698,36 @@ ExecInsert(ModifyTableState *mtstate,
 			if (resultRelInfo->ri_Slots == NULL)
 			{
 				resultRelInfo->ri_Slots = palloc(sizeof(TupleTableSlot *) *
-										   resultRelInfo->ri_BatchSize);
+												 resultRelInfo->ri_BatchSize);
 				resultRelInfo->ri_PlanSlots = palloc(sizeof(TupleTableSlot *) *
-										   resultRelInfo->ri_BatchSize);
+													 resultRelInfo->ri_BatchSize);
 			}
 
-			resultRelInfo->ri_Slots[resultRelInfo->ri_NumSlots] =
-				MakeSingleTupleTableSlot(slot->tts_tupleDescriptor,
-										 slot->tts_ops);
+			/*
+			 * Initialize the batch slots. We don't know how many slots will
+			 * be needed, so we initialize them as the batch grows, and we
+			 * keep them across batches. To mitigate an inefficiency in how
+			 * resource owner handles objects with many references (as with
+			 * many slots all referencing the same tuple descriptor) we copy
+			 * the tuple descriptor for each slot.
+			 */
+			if (resultRelInfo->ri_NumSlots >= resultRelInfo->ri_NumSlotsInitialized)
+			{
+				TupleDesc	tdesc = CreateTupleDescCopy(slot->tts_tupleDescriptor);
+
+				resultRelInfo->ri_Slots[resultRelInfo->ri_NumSlots] =
+					MakeSingleTupleTableSlot(tdesc, slot->tts_ops);
+
+				resultRelInfo->ri_PlanSlots[resultRelInfo->ri_NumSlots] =
+					MakeSingleTupleTableSlot(tdesc, planSlot->tts_ops);
+
+				/* remember how many batch slots we initialized */
+				resultRelInfo->ri_NumSlotsInitialized++;
+			}
+
 			ExecCopySlot(resultRelInfo->ri_Slots[resultRelInfo->ri_NumSlots],
 						 slot);
-			resultRelInfo->ri_PlanSlots[resultRelInfo->ri_NumSlots] =
-				MakeSingleTupleTableSlot(planSlot->tts_tupleDescriptor,
-										 planSlot->tts_ops);
+
 			ExecCopySlot(resultRelInfo->ri_PlanSlots[resultRelInfo->ri_NumSlots],
 						 planSlot);
 
@@ -731,7 +752,7 @@ ExecInsert(ModifyTableState *mtstate,
 		/*
 		 * AFTER ROW Triggers or RETURNING expressions might reference the
 		 * tableoid column, so (re-)initialize tts_tableOid before evaluating
-		 * them.
+		 * them.  (This covers the case where the FDW replaced the slot.)
 		 */
 		slot->tts_tableOid = RelationGetRelid(resultRelInfo->ri_RelationDesc);
 	}
@@ -740,8 +761,8 @@ ExecInsert(ModifyTableState *mtstate,
 		WCOKind		wco_kind;
 
 		/*
-		 * Constraints might reference the tableoid column, so (re-)initialize
-		 * tts_tableOid before evaluating them.
+		 * Constraints and GENERATED expressions might reference the tableoid
+		 * column, so (re-)initialize tts_tableOid before evaluating them.
 		 */
 		slot->tts_tableOid = RelationGetRelid(resultRelationDesc);
 
@@ -984,12 +1005,12 @@ ExecInsert(ModifyTableState *mtstate,
  */
 static void
 ExecBatchInsert(ModifyTableState *mtstate,
-		   ResultRelInfo *resultRelInfo,
-		   TupleTableSlot **slots,
-		   TupleTableSlot **planSlots,
-		   int numSlots,
-		   EState *estate,
-		   bool canSetTag)
+				ResultRelInfo *resultRelInfo,
+				TupleTableSlot **slots,
+				TupleTableSlot **planSlots,
+				int numSlots,
+				EState *estate,
+				bool canSetTag)
 {
 	int			i;
 	int			numInserted = numSlots;
@@ -1000,10 +1021,10 @@ ExecBatchInsert(ModifyTableState *mtstate,
 	 * insert into foreign table: let the FDW do it
 	 */
 	rslots = resultRelInfo->ri_FdwRoutine->ExecForeignBatchInsert(estate,
-																 resultRelInfo,
-																 slots,
-																 planSlots,
-																 &numInserted);
+																  resultRelInfo,
+																  slots,
+																  planSlots,
+																  &numInserted);
 
 	for (i = 0; i < numInserted; i++)
 	{
@@ -1030,12 +1051,6 @@ ExecBatchInsert(ModifyTableState *mtstate,
 
 	if (canSetTag && numInserted > 0)
 		estate->es_processed += numInserted;
-
-	for (i = 0; i < numSlots; i++)
-	{
-		ExecDropSingleTupleTableSlot(slots[i]);
-		ExecDropSingleTupleTableSlot(planSlots[i]);
-	}
 }
 
 /* ----------------------------------------------------------------
@@ -1632,6 +1647,12 @@ ExecUpdate(ModifyTableState *mtstate,
 	else if (resultRelInfo->ri_FdwRoutine)
 	{
 		/*
+		 * GENERATED expressions might reference the tableoid column, so
+		 * (re-)initialize tts_tableOid before evaluating them.
+		 */
+		slot->tts_tableOid = RelationGetRelid(resultRelInfo->ri_RelationDesc);
+
+		/*
 		 * Compute stored generated columns
 		 */
 		if (resultRelationDesc->rd_att->constr &&
@@ -1653,7 +1674,7 @@ ExecUpdate(ModifyTableState *mtstate,
 		/*
 		 * AFTER ROW Triggers or RETURNING expressions might reference the
 		 * tableoid column, so (re-)initialize tts_tableOid before evaluating
-		 * them.
+		 * them.  (This covers the case where the FDW replaced the slot.)
 		 */
 		slot->tts_tableOid = RelationGetRelid(resultRelationDesc);
 	}
@@ -1664,8 +1685,8 @@ ExecUpdate(ModifyTableState *mtstate,
 		bool		update_indexes;
 
 		/*
-		 * Constraints might reference the tableoid column, so (re-)initialize
-		 * tts_tableOid before evaluating them.
+		 * Constraints and GENERATED expressions might reference the tableoid
+		 * column, so (re-)initialize tts_tableOid before evaluating them.
 		 */
 		slot->tts_tableOid = RelationGetRelid(resultRelationDesc);
 
@@ -2606,10 +2627,10 @@ ExecModifyTable(PlanState *pstate)
 		resultRelInfo = lfirst(lc);
 		if (resultRelInfo->ri_NumSlots > 0)
 			ExecBatchInsert(node, resultRelInfo,
-						   resultRelInfo->ri_Slots,
-						   resultRelInfo->ri_PlanSlots,
-						   resultRelInfo->ri_NumSlots,
-						   estate, node->canSetTag);
+							resultRelInfo->ri_Slots,
+							resultRelInfo->ri_PlanSlots,
+							resultRelInfo->ri_NumSlots,
+							estate, node->canSetTag);
 	}
 
 	/*
@@ -2975,9 +2996,9 @@ ExecInitModifyTable(ModifyTable *node, EState *estate, int eflags)
 	 */
 	if (node->onConflictAction == ONCONFLICT_UPDATE)
 	{
+		OnConflictSetState *onconfl = makeNode(OnConflictSetState);
 		ExprContext *econtext;
 		TupleDesc	relationDesc;
-		TupleDesc	tupDesc;
 
 		/* already exists if created by RETURNING processing above */
 		if (mtstate->ps.ps_ExprContext == NULL)
@@ -2987,10 +3008,10 @@ ExecInitModifyTable(ModifyTable *node, EState *estate, int eflags)
 		relationDesc = resultRelInfo->ri_RelationDesc->rd_att;
 
 		/* create state for DO UPDATE SET operation */
-		resultRelInfo->ri_onConflict = makeNode(OnConflictSetState);
+		resultRelInfo->ri_onConflict = onconfl;
 
 		/* initialize slot for the existing tuple */
-		resultRelInfo->ri_onConflict->oc_Existing =
+		onconfl->oc_Existing =
 			table_slot_create(resultRelInfo->ri_RelationDesc,
 							  &mtstate->ps.state->es_tupleTable);
 
@@ -3000,17 +3021,19 @@ ExecInitModifyTable(ModifyTable *node, EState *estate, int eflags)
 		 * into the table, and for RETURNING processing - which may access
 		 * system attributes.
 		 */
-		tupDesc = ExecTypeFromTL((List *) node->onConflictSet);
-		resultRelInfo->ri_onConflict->oc_ProjSlot =
-			ExecInitExtraTupleSlot(mtstate->ps.state, tupDesc,
-								   table_slot_callbacks(resultRelInfo->ri_RelationDesc));
+		onconfl->oc_ProjSlot =
+			table_slot_create(resultRelInfo->ri_RelationDesc,
+							  &mtstate->ps.state->es_tupleTable);
 
 		/* build UPDATE SET projection state */
-		resultRelInfo->ri_onConflict->oc_ProjInfo =
-			ExecBuildProjectionInfo(node->onConflictSet, econtext,
-									resultRelInfo->ri_onConflict->oc_ProjSlot,
-									&mtstate->ps,
-									relationDesc);
+		onconfl->oc_ProjInfo =
+			ExecBuildUpdateProjection(node->onConflictSet,
+									  true,
+									  node->onConflictCols,
+									  relationDesc,
+									  econtext,
+									  onconfl->oc_ProjSlot,
+									  &mtstate->ps);
 
 		/* initialize state to evaluate the WHERE clause, if any */
 		if (node->onConflictWhere)
@@ -3019,7 +3042,7 @@ ExecInitModifyTable(ModifyTable *node, EState *estate, int eflags)
 
 			qualexpr = ExecInitQual((List *) node->onConflictWhere,
 									&mtstate->ps);
-			resultRelInfo->ri_onConflict->oc_WhereClause = qualexpr;
+			onconfl->oc_WhereClause = qualexpr;
 		}
 	}
 
@@ -3091,12 +3114,12 @@ ExecInitModifyTable(ModifyTable *node, EState *estate, int eflags)
 		mtstate->mt_resultOidHash = NULL;
 
 	/*
-	 * Determine if the FDW supports batch insert and determine the batch
-	 * size (a FDW may support batching, but it may be disabled for the
+	 * Determine if the FDW supports batch insert and determine the batch size
+	 * (a FDW may support batching, but it may be disabled for the
 	 * server/table).
 	 *
-	 * We only do this for INSERT, so that for UPDATE/DELETE the batch
-	 * size remains set to 0.
+	 * We only do this for INSERT, so that for UPDATE/DELETE the batch size
+	 * remains set to 0.
 	 */
 	if (operation == CMD_INSERT)
 	{
@@ -3150,6 +3173,7 @@ ExecEndModifyTable(ModifyTableState *node)
 	 */
 	for (i = 0; i < node->mt_nrels; i++)
 	{
+		int			j;
 		ResultRelInfo *resultRelInfo = node->resultRelInfo + i;
 
 		if (!resultRelInfo->ri_usesFdwDirectModify &&
@@ -3157,6 +3181,17 @@ ExecEndModifyTable(ModifyTableState *node)
 			resultRelInfo->ri_FdwRoutine->EndForeignModify != NULL)
 			resultRelInfo->ri_FdwRoutine->EndForeignModify(node->ps.state,
 														   resultRelInfo);
+
+		/*
+		 * Cleanup the initialized batch slots. This only matters for FDWs
+		 * with batching, but the other cases will have ri_NumSlotsInitialized
+		 * == 0.
+		 */
+		for (j = 0; j < resultRelInfo->ri_NumSlotsInitialized; j++)
+		{
+			ExecDropSingleTupleTableSlot(resultRelInfo->ri_Slots[j]);
+			ExecDropSingleTupleTableSlot(resultRelInfo->ri_PlanSlots[j]);
+		}
 	}
 
 	/*

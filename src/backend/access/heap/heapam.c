@@ -432,11 +432,11 @@ heapgetpage(TableScanDesc sscan, BlockNumber page)
 	 * transactions on the primary might still be invisible to a read-only
 	 * transaction in the standby. We partly handle this problem by tracking
 	 * the minimum xmin of visible tuples as the cut-off XID while marking a
-	 * page all-visible on the primary and WAL log that along with the visibility
-	 * map SET operation. In hot standby, we wait for (or abort) all
-	 * transactions that can potentially may not see one or more tuples on the
-	 * page. That's how index-only scans work fine in hot standby. A crucial
-	 * difference between index-only scans and heap scans is that the
+	 * page all-visible on the primary and WAL log that along with the
+	 * visibility map SET operation. In hot standby, we wait for (or abort)
+	 * all transactions that can potentially may not see one or more tuples on
+	 * the page. That's how index-only scans work fine in hot standby. A
+	 * crucial difference between index-only scans and heap scans is that the
 	 * index-only scan completely relies on the visibility map where as heap
 	 * scan looks at the page-level PD_ALL_VISIBLE flag. We are not sure if
 	 * the page-level flag can be trusted in the same way, because it might
@@ -635,8 +635,15 @@ heapgettup(HeapScanDesc scan,
 		}
 		else
 		{
+			/*
+			 * The previous returned tuple may have been vacuumed since the
+			 * previous scan when we use a non-MVCC snapshot, so we must
+			 * re-establish the lineoff <= PageGetMaxOffsetNumber(dp)
+			 * invariant
+			 */
 			lineoff =			/* previous offnum */
-				OffsetNumberPrev(ItemPointerGetOffsetNumber(&(tuple->t_self)));
+				Min(lines,
+					OffsetNumberPrev(ItemPointerGetOffsetNumber(&(tuple->t_self))));
 		}
 		/* page and lineoff now reference the physically previous tid */
 
@@ -678,6 +685,13 @@ heapgettup(HeapScanDesc scan,
 	lpp = PageGetItemId(dp, lineoff);
 	for (;;)
 	{
+		/*
+		 * Only continue scanning the page while we have lines left.
+		 *
+		 * Note that this protects us from accessing line pointers past
+		 * PageGetMaxOffsetNumber(); both for forward scans when we resume the
+		 * table scan, and for when we start scanning a new page.
+		 */
 		while (linesleft > 0)
 		{
 			if (ItemIdIsNormal(lpp))
@@ -2049,12 +2063,12 @@ heap_insert(Relation relation, HeapTuple tup, CommandId cid,
 	TransactionId xid = GetCurrentTransactionId();
 	HeapTuple	heaptup;
 	Buffer		buffer;
-	Page		page = NULL;
 	Buffer		vmbuffer = InvalidBuffer;
-	bool		starting_with_empty_page;
 	bool		all_visible_cleared = false;
-	bool		all_frozen_set = false;
-	uint8		vmstatus = 0;
+
+	/* Cheap, simplistic check that the tuple matches the rel's rowtype. */
+	Assert(HeapTupleHeaderGetNatts(tup->t_data) <=
+		   RelationGetNumberOfAttributes(relation));
 
 	/*
 	 * Fill in tuple header fields and toast the tuple if necessary.
@@ -2067,35 +2081,10 @@ heap_insert(Relation relation, HeapTuple tup, CommandId cid,
 	/*
 	 * Find buffer to insert this tuple into.  If the page is all visible,
 	 * this will also pin the requisite visibility map page.
-	 *
-	 * Also pin visibility map page if COPY FREEZE inserts tuples into an
-	 * empty page. See all_frozen_set below.
 	 */
 	buffer = RelationGetBufferForTuple(relation, heaptup->t_len,
 									   InvalidBuffer, options, bistate,
 									   &vmbuffer, NULL);
-
-
-	/*
-	 * If we're inserting frozen entry into an empty page,
-	 * set visibility map bits and PageAllVisible() hint.
-	 *
-	 * If we're inserting frozen entry into already all_frozen page,
-	 * preserve this state.
-	 */
-	if (options & HEAP_INSERT_FROZEN)
-	{
-		page = BufferGetPage(buffer);
-
-		starting_with_empty_page = PageGetMaxOffsetNumber(page) == 0;
-
-		if (visibilitymap_pin_ok(BufferGetBlockNumber(buffer), vmbuffer))
-			vmstatus = visibilitymap_get_status(relation,
-								 BufferGetBlockNumber(buffer), &vmbuffer);
-
-		if ((starting_with_empty_page || vmstatus & VISIBILITYMAP_ALL_FROZEN))
-			all_frozen_set = true;
-	}
 
 	/*
 	 * We're about to do the actual insert -- but check for conflict first, to
@@ -2120,27 +2109,13 @@ heap_insert(Relation relation, HeapTuple tup, CommandId cid,
 	RelationPutHeapTuple(relation, buffer, heaptup,
 						 (options & HEAP_INSERT_SPECULATIVE) != 0);
 
-	/*
-	 * If the page is all visible, need to clear that, unless we're only
-	 * going to add further frozen rows to it.
-	 *
-	 * If we're only adding already frozen rows to a page that was empty or
-	 * marked as all visible, mark it as all-visible.
-	 */
-	if (PageIsAllVisible(BufferGetPage(buffer)) && !(options & HEAP_INSERT_FROZEN))
+	if (PageIsAllVisible(BufferGetPage(buffer)))
 	{
 		all_visible_cleared = true;
 		PageClearAllVisible(BufferGetPage(buffer));
 		visibilitymap_clear(relation,
 							ItemPointerGetBlockNumber(&(heaptup->t_self)),
 							vmbuffer, VISIBILITYMAP_VALID_BITS);
-	}
-	else if (all_frozen_set)
-	{
-		/* We only ever set all_frozen_set after reading the page. */
-		Assert(page);
-
-		PageSetAllVisible(page);
 	}
 
 	/*
@@ -2189,8 +2164,6 @@ heap_insert(Relation relation, HeapTuple tup, CommandId cid,
 		xlrec.flags = 0;
 		if (all_visible_cleared)
 			xlrec.flags |= XLH_INSERT_ALL_VISIBLE_CLEARED;
-		if (all_frozen_set)
-			xlrec.flags = XLH_INSERT_ALL_FROZEN_SET;
 		if (options & HEAP_INSERT_SPECULATIVE)
 			xlrec.flags |= XLH_INSERT_IS_SPECULATIVE;
 		Assert(ItemPointerGetBlockNumber(&heaptup->t_self) == BufferGetBlockNumber(buffer));
@@ -2238,29 +2211,6 @@ heap_insert(Relation relation, HeapTuple tup, CommandId cid,
 	}
 
 	END_CRIT_SECTION();
-
-	/*
-	 * If we've frozen everything on the page, update the visibilitymap.
-	 * We're already holding pin on the vmbuffer.
-	 *
-	 * No need to update the visibilitymap if it had all_frozen bit set
-	 * before this insertion.
-	 */
-	if (all_frozen_set && ((vmstatus & VISIBILITYMAP_ALL_FROZEN) == 0))
-	{
-		Assert(PageIsAllVisible(page));
-		Assert(visibilitymap_pin_ok(BufferGetBlockNumber(buffer), vmbuffer));
-
-		/*
-		 * It's fine to use InvalidTransactionId here - this is only used
-		 * when HEAP_INSERT_FROZEN is specified, which intentionally
-		 * violates visibility rules.
-		 */
-		visibilitymap_set(relation, BufferGetBlockNumber(buffer), buffer,
-							InvalidXLogRecPtr, vmbuffer,
-							InvalidTransactionId,
-							VISIBILITYMAP_ALL_VISIBLE | VISIBILITYMAP_ALL_FROZEN);
-	}
 
 	UnlockReleaseBuffer(buffer);
 	if (vmbuffer != InvalidBuffer)
@@ -2338,7 +2288,7 @@ heap_prepare_insert(Relation relation, HeapTuple tup, TransactionId xid,
 }
 
 /*
- *	heap_multi_insert	- insert multiple tuple into a heap
+ *	heap_multi_insert	- insert multiple tuples into a heap
  *
  * This is like heap_insert(), but inserts multiple tuples in one operation.
  * That's faster than calling heap_insert() in a loop, because when multiple
@@ -2529,7 +2479,7 @@ heap_multi_insert(Relation relation, TupleTableSlot **slots, int ntuples,
 			tupledata = scratchptr;
 
 			/* check that the mutually exclusive flags are not both set */
-			Assert (!(all_visible_cleared && all_frozen_set));
+			Assert(!(all_visible_cleared && all_frozen_set));
 
 			xlrec->flags = 0;
 			if (all_visible_cleared)
@@ -3045,7 +2995,10 @@ l1:
 		xl_heap_header xlhdr;
 		XLogRecPtr	recptr;
 
-		/* For logical decode we need combo CIDs to properly decode the catalog */
+		/*
+		 * For logical decode we need combo CIDs to properly decode the
+		 * catalog
+		 */
 		if (RelationIsAccessibleInLogicalDecoding(relation))
 			log_heap_new_cid(relation, &tp);
 
@@ -3240,6 +3193,10 @@ heap_update(Relation relation, ItemPointer otid, HeapTuple newtup,
 				infomask2_new_tuple;
 
 	Assert(ItemPointerIsValid(otid));
+
+	/* Cheap, simplistic check that the tuple matches the rel's rowtype. */
+	Assert(HeapTupleHeaderGetNatts(newtup->t_data) <=
+		   RelationGetNumberOfAttributes(relation));
 
 	/*
 	 * Forbid this during a parallel operation, lest it allocate a combo CID.
@@ -3770,7 +3727,7 @@ l2:
 		 * overhead would be unchanged, that doesn't seem necessarily
 		 * worthwhile.
 		 */
-		if (PageIsAllVisible(BufferGetPage(buffer)) &&
+		if (PageIsAllVisible(page) &&
 			visibilitymap_clear(relation, block, vmbuffer,
 								VISIBILITYMAP_ALL_FROZEN))
 			cleared_all_frozen = true;
@@ -3832,36 +3789,46 @@ l2:
 		 * first".  To implement this, we must do RelationGetBufferForTuple
 		 * while not holding the lock on the old page, and we must rely on it
 		 * to get the locks on both pages in the correct order.
+		 *
+		 * Another consideration is that we need visibility map page pin(s) if
+		 * we will have to clear the all-visible flag on either page.  If we
+		 * call RelationGetBufferForTuple, we rely on it to acquire any such
+		 * pins; but if we don't, we have to handle that here.  Hence we need
+		 * a loop.
 		 */
-		if (newtupsize > pagefree)
+		for (;;)
 		{
-			/* Assume there's no chance to put heaptup on same page. */
-			newbuf = RelationGetBufferForTuple(relation, heaptup->t_len,
-											   buffer, 0, NULL,
-											   &vmbuffer_new, &vmbuffer);
-		}
-		else
-		{
+			if (newtupsize > pagefree)
+			{
+				/* It doesn't fit, must use RelationGetBufferForTuple. */
+				newbuf = RelationGetBufferForTuple(relation, heaptup->t_len,
+												   buffer, 0, NULL,
+												   &vmbuffer_new, &vmbuffer);
+				/* We're all done. */
+				break;
+			}
+			/* Acquire VM page pin if needed and we don't have it. */
+			if (vmbuffer == InvalidBuffer && PageIsAllVisible(page))
+				visibilitymap_pin(relation, block, &vmbuffer);
 			/* Re-acquire the lock on the old tuple's page. */
 			LockBuffer(buffer, BUFFER_LOCK_EXCLUSIVE);
 			/* Re-check using the up-to-date free space */
 			pagefree = PageGetHeapFreeSpace(page);
-			if (newtupsize > pagefree)
+			if (newtupsize > pagefree ||
+				(vmbuffer == InvalidBuffer && PageIsAllVisible(page)))
 			{
 				/*
-				 * Rats, it doesn't fit anymore.  We must now unlock and
-				 * relock to avoid deadlock.  Fortunately, this path should
-				 * seldom be taken.
+				 * Rats, it doesn't fit anymore, or somebody just now set the
+				 * all-visible flag.  We must now unlock and loop to avoid
+				 * deadlock.  Fortunately, this path should seldom be taken.
 				 */
 				LockBuffer(buffer, BUFFER_LOCK_UNLOCK);
-				newbuf = RelationGetBufferForTuple(relation, heaptup->t_len,
-												   buffer, 0, NULL,
-												   &vmbuffer_new, &vmbuffer);
 			}
 			else
 			{
-				/* OK, it fits here, so we're done. */
+				/* We're all done. */
 				newbuf = buffer;
+				break;
 			}
 		}
 	}
@@ -3886,7 +3853,8 @@ l2:
 	 * will include checking the relation level, there is no benefit to a
 	 * separate check for the new tuple.
 	 */
-	CheckForSerializableConflictIn(relation, otid, BufferGetBlockNumber(buffer));
+	CheckForSerializableConflictIn(relation, &oldtup.t_self,
+								   BufferGetBlockNumber(buffer));
 
 	/*
 	 * At this point newbuf and buffer are both pinned and locked, and newbuf
@@ -7899,16 +7867,16 @@ bottomup_sort_and_shrink(TM_IndexDeleteOp *delstate)
 	 * TIDs as each other.  The goal is to ignore relatively small differences
 	 * in the total number of promising entries, so that the whole process can
 	 * give a little weight to heapam factors (like heap block locality)
-	 * instead.  This isn't a trade-off, really -- we have nothing to lose.
-	 * It would be foolish to interpret small differences in npromisingtids
+	 * instead.  This isn't a trade-off, really -- we have nothing to lose. It
+	 * would be foolish to interpret small differences in npromisingtids
 	 * values as anything more than noise.
 	 *
 	 * We tiebreak on nhtids when sorting block group subsets that have the
 	 * same npromisingtids, but this has the same issues as npromisingtids,
-	 * and so nhtids is subject to the same power-of-two bucketing scheme.
-	 * The only reason that we don't fix nhtids in the same way here too is
-	 * that we'll need accurate nhtids values after the sort.  We handle
-	 * nhtids bucketization dynamically instead (in the sort comparator).
+	 * and so nhtids is subject to the same power-of-two bucketing scheme. The
+	 * only reason that we don't fix nhtids in the same way here too is that
+	 * we'll need accurate nhtids values after the sort.  We handle nhtids
+	 * bucketization dynamically instead (in the sort comparator).
 	 *
 	 * See bottomup_nblocksfavorable() for a full explanation of when and how
 	 * heap locality/favorable blocks can significantly influence when and how
@@ -8556,10 +8524,8 @@ heap_xlog_vacuum(XLogReaderState *record)
 			ItemIdSetUnused(lp);
 		}
 
-		/*
-		 * Update the page's hint bit about whether it has free pointers
-		 */
-		PageSetHasFreeLinePointers(page);
+		/* Attempt to truncate line pointer array now */
+		PageTruncateLinePointerArray(page);
 
 		PageSetLSN(page, lsn);
 		MarkBufferDirty(buffer);
@@ -8912,10 +8878,6 @@ heap_xlog_insert(XLogReaderState *record)
 	ItemPointerSetBlockNumber(&target_tid, blkno);
 	ItemPointerSetOffsetNumber(&target_tid, xlrec->offnum);
 
-	/* check that the mutually exclusive flags are not both set */
-	Assert (!((xlrec->flags & XLH_INSERT_ALL_VISIBLE_CLEARED) &&
-			  (xlrec->flags & XLH_INSERT_ALL_FROZEN_SET)));
-
 	/*
 	 * The visibility map may need to be fixed even if the heap page is
 	 * already up-to-date.
@@ -9041,8 +9003,8 @@ heap_xlog_multi_insert(XLogReaderState *record)
 	XLogRecGetBlockTag(record, 0, &rnode, NULL, &blkno);
 
 	/* check that the mutually exclusive flags are not both set */
-	Assert (!((xlrec->flags & XLH_INSERT_ALL_VISIBLE_CLEARED) &&
-			  (xlrec->flags & XLH_INSERT_ALL_FROZEN_SET)));
+	Assert(!((xlrec->flags & XLH_INSERT_ALL_VISIBLE_CLEARED) &&
+			 (xlrec->flags & XLH_INSERT_ALL_FROZEN_SET)));
 
 	/*
 	 * The visibility map may need to be fixed even if the heap page is

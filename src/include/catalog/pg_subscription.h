@@ -34,7 +34,10 @@
  * them to be able to start the workers, so we have to put them in a shared,
  * nailed catalog.
  *
- * NOTE:  When adding a column, also update system_views.sql.
+ * CAUTION:  There is a GRANT in system_views.sql to grant public select
+ * access on all columns except subconninfo.  When you add a new column
+ * here, be sure to update that (or, if the new column is not to be publicly
+ * readable, update associated comments and catalogs.sgml instead).
  */
 CATALOG(pg_subscription,6100,SubscriptionRelationId) BKI_SHARED_RELATION BKI_ROWTYPE_OID(6101,SubscriptionRelation_Rowtype_Id) BKI_SCHEMA_MACRO
 {
@@ -75,10 +78,8 @@ DECLARE_TOAST(pg_subscription, 4183, 4184);
 #define PgSubscriptionToastTable 4183
 #define PgSubscriptionToastIndex 4184
 
-DECLARE_UNIQUE_INDEX_PKEY(pg_subscription_oid_index, 6114, on pg_subscription using btree(oid oid_ops));
-#define SubscriptionObjectIndexId 6114
-DECLARE_UNIQUE_INDEX(pg_subscription_subname_index, 6115, on pg_subscription using btree(subdbid oid_ops, subname name_ops));
-#define SubscriptionNameIndexId 6115
+DECLARE_UNIQUE_INDEX_PKEY(pg_subscription_oid_index, 6114, SubscriptionObjectIndexId, on pg_subscription using btree(oid oid_ops));
+DECLARE_UNIQUE_INDEX(pg_subscription_subname_index, 6115, SubscriptionNameIndexId, on pg_subscription using btree(subdbid oid_ops, subname name_ops));
 
 typedef struct Subscription
 {

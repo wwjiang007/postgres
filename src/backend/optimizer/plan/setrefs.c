@@ -756,6 +756,12 @@ set_plan_refs(PlannerInfo *root, Plan *plan, int rtoffset)
 			{
 				ResultCache *rcplan = (ResultCache *) plan;
 
+				/*
+				 * Result Cache does not evaluate its targetlist.  It just
+				 * uses the same targetlist from its outer subnode.
+				 */
+				set_dummy_tlist_references(plan, rtoffset);
+
 				rcplan->param_exprs = fix_scan_list(root, rcplan->param_exprs,
 													rtoffset,
 													NUM_EXEC_TLIST(plan));
@@ -1674,9 +1680,13 @@ fix_expr_common(PlannerInfo *root, Node *node)
 	}
 	else if (IsA(node, ScalarArrayOpExpr))
 	{
-		set_sa_opfuncid((ScalarArrayOpExpr *) node);
-		record_plan_function_dependency(root,
-										((ScalarArrayOpExpr *) node)->opfuncid);
+		ScalarArrayOpExpr *saop = (ScalarArrayOpExpr *) node;
+
+		set_sa_opfuncid(saop);
+		record_plan_function_dependency(root, saop->opfuncid);
+
+		if (!OidIsValid(saop->hashfuncid))
+			record_plan_function_dependency(root, saop->hashfuncid);
 	}
 	else if (IsA(node, Const))
 	{
